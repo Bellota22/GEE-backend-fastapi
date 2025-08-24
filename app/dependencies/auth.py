@@ -94,6 +94,7 @@ def authorize(allowed_roles: Optional[List[str]] = None):
     If no roles are provided, any authenticated active user is allowed.
     """
     async def role_checker(current_user: UserResponse = Depends(get_current_active_user)):
+        print("current_user.role =", current_user.role)
         if allowed_roles:
             user_role = current_user.role
             if user_role not in allowed_roles:

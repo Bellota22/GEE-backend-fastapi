@@ -31,7 +31,7 @@ async def create_user(
             detail="User with this email already exists"            
         )
 
-    user_in.role = UserRole.USER.value
+    # user_in.role = UserRole.USER.value
     user = await user_service.create(user_in)
     return create_response(
         data=UserResponse.from_orm(user),

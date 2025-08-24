@@ -27,6 +27,7 @@ class UserService:
         return users
 
     async def create(self, obj_in: UserCreate) -> User:
+        print(obj_in)
         """Create a new user"""
         hashed_password = get_password_hash(obj_in.password)        
 

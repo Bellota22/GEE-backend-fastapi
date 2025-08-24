@@ -1,6 +1,7 @@
 FROM python:alpine
 
 WORKDIR /app/
+COPY key.json /app/key.json
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
