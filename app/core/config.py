@@ -61,6 +61,8 @@ class Settings:
         self.APP_ENV = os.getenv("APP_ENV", os.getenv("ENVIRONMENT", "local")).lower()
         self.IS_DOCKER = _bool_env("DOCKERIZED", os.path.exists("/.dockerenv"))
         self.IS_WINDOWS = platform.system().lower() == "windows"
+        self.IS_CLOUD_RUN = bool(os.getenv("K_SERVICE"))
+        self.USE_ADC = (self.IS_CLOUD_RUN or self.APP_ENV in ("docker", "production"))
 
         # -------- API / Auth --------
         self.API_V1_STR = os.getenv("API_V1_STR", "/api/v1")
@@ -99,10 +101,13 @@ class Settings:
         self.GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
         default_local_path = r"D:\Projects\Projects\58-AGRAS\key.json" if self.IS_WINDOWS else "/app/key.json"
-        default_docker_path = "/app/key.json"
-        self.GEE_KEY_PATH = os.getenv("GEE_KEY_PATH") or (
-            default_docker_path if (self.IS_DOCKER or self.APP_ENV in ("docker", "production")) else default_local_path
-        )
+        self.GEE_KEY_PATH = os.getenv("GEE_KEY_PATH")
+
+        # En local Windows te dejo un “comodín” opcional si existe el archivo
+        if not self.GEE_KEY_PATH and not self.USE_ADC:
+            default_local_path = r"D:\Projects\Projects\58-AGRAS\key.json"
+            if os.path.exists(default_local_path):
+                self.GEE_KEY_PATH = default_local_path
 
         self.TILES_DEFAULT_CID = os.getenv("TILES_DEFAULT_CID", "abc123")
         self.S2_COLLECTION = os.getenv("S2_COLLECTION", "COPERNICUS/S2_HARMONIZED")
@@ -125,7 +130,12 @@ class Settings:
         if self.GEE_KEY_B64:
             decoded = base64.b64decode(self.GEE_KEY_B64).decode("utf-8")
             return {"from_info": json.loads(decoded)}
+
         path = self.GOOGLE_APPLICATION_CREDENTIALS or self.GEE_KEY_PATH
-        return {"from_file": path}
+        if path and os.path.exists(path):
+            return {"from_file": path}
+
+        # Nada: usar ADC (Cloud Run)
+        return {}
 
 settings = Settings()

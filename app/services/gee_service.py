@@ -1,35 +1,75 @@
-# app/services/gee_service.py
+# app/services/gee_services.py
 from __future__ import annotations
 import datetime
+import threading
 from typing import Dict, List, Optional, Tuple
 
 import ee
 import requests
-from google.oauth2 import service_account
+import google.auth
+from google.auth.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import service_account
 
 from app.core.config import settings
 
-# ---------- Inicialización de EE ----------
-def _init_ee():
+# ---- Estado de inicialización (thread-safe) ----
+_EE_LOCK = threading.Lock()
+_EE_INIT = False
+_CREDS: Optional[Credentials] = None
+
+EE_SCOPES = [
+    "https://www.googleapis.com/auth/earthengine",
+    "https://www.googleapis.com/auth/devstorage.read_write",  # si no usas GCS, puedes quitar esta
+]
+
+def _resolve_credentials() -> Tuple[Credentials, Optional[str]]:
+    """
+    Devuelve (credentials, project_id) en este orden de prioridad:
+    - JSON inline (GEE_KEY_JSON / GEE_KEY_B64)
+    - Archivo (GEE_KEY_PATH / GOOGLE_APPLICATION_CREDENTIALS) si existe
+    - ADC (Cloud Run / gcloud ADC local)
+    """
     kw = settings.get_gee_credentials_kwargs()
+
     if "from_info" in kw:
         creds = service_account.Credentials.from_service_account_info(
-            kw["from_info"],
-            scopes=["https://www.googleapis.com/auth/earthengine"],
-            quota_project_id=settings.EARTHENGINE_PROJECT,
+            kw["from_info"], scopes=EE_SCOPES
         )
-    else:
-        creds = service_account.Credentials.from_service_account_file(
-            kw["from_file"],
-            scopes=["https://www.googleapis.com/auth/earthengine"],
-            quota_project_id=settings.EARTHENGINE_PROJECT,
-        )
-    ee.Initialize(credentials=creds, project=settings.EARTHENGINE_PROJECT)
-    return creds
+        return creds, settings.EARTHENGINE_PROJECT
 
-# Guardamos las credenciales de SA para refrescar en el proxy
-_CREDENTIALS: service_account.Credentials = _init_ee()
+    if "from_file" in kw:
+        creds = service_account.Credentials.from_service_account_file(
+            kw["from_file"], scopes=EE_SCOPES
+        )
+        return creds, settings.EARTHENGINE_PROJECT
+
+    # Fallback: ADC
+    creds, project_id = google.auth.default(scopes=EE_SCOPES)
+    project_id = settings.EARTHENGINE_PROJECT or project_id
+    return creds, project_id
+
+def ensure_ee_initialized() -> None:
+    """Inicializa Earth Engine una sola vez de forma segura."""
+    global _EE_INIT, _CREDS
+    if _EE_INIT:
+        return
+    with _EE_LOCK:
+        if _EE_INIT:
+            return
+        creds, project_id = _resolve_credentials()
+        ee.Initialize(credentials=creds, project=project_id)
+        _CREDS = creds
+        _EE_INIT = True
+
+def _get_access_token() -> str:
+    """Devuelve un access token válido para llamar a la API de EE."""
+    ensure_ee_initialized()
+    assert _CREDS is not None
+    # Refresca si hace falta
+    _CREDS.refresh(GoogleAuthRequest())
+    # Tras refresh, .token debe estar presente
+    return getattr(_CREDS, "token", "")
 
 # ---------- Helpers GEE puros ----------
 def make_aoi(lon_min: float, lat_min: float, lon_max: float, lat_max: float) -> ee.Geometry:
@@ -111,7 +151,6 @@ def parse_mapid(raw_mapid: str) -> Tuple[Optional[str], str]:
 # ---------- Servicio de alto nivel ----------
 class GEEService:
     def __init__(self) -> None:
-        # EE ya fue inicializado a nivel módulo; guardamos settings
         self.default_cid = settings.TILES_DEFAULT_CID
 
     # --- Consultas ---
@@ -120,6 +159,7 @@ class GEEService:
         Devuelve [{year, month, NDVI, NDMI, SI}, ...] ordenado por fecha.
         Calcula estadísticas con un único getInfo() usando FeatureCollection.map.
         """
+        ensure_ee_initialized()  # 👈 nos aseguramos aquí
         ic = build_monthly_composites(aoi, start, end)
 
         def to_feature(img: ee.Image):
@@ -130,7 +170,6 @@ class GEEService:
                 maxPixels=1e9,
                 tileScale=2,
             )
-            # Guardamos propiedades de fecha + medias como atributos del Feature
             return ee.Feature(None, {
                 "year": img.get("year"),
                 "month": img.get("month"),
@@ -142,7 +181,7 @@ class GEEService:
         fc = ee.FeatureCollection(ic.map(to_feature))
         data = fc.getInfo()  # único getInfo
         feats = data.get("features", [])
-        out = []
+        out: List[Dict] = []
         for f in feats:
             p = f.get("properties", {})
             out.append({
@@ -152,7 +191,6 @@ class GEEService:
                 "ndmi": p.get("NDMI"),
                 "si":   p.get("SI"),
             })
-        # Aseguramos orden por año/mes
         out.sort(key=lambda r: (r["year"], r["month"]))
         return out
 
@@ -164,13 +202,13 @@ class GEEService:
         base_url: str, proxy_path_builder,
         client_id_header: Optional[str],
     ) -> Dict:
+        ensure_ee_initialized()  # 👈 nos aseguramos aquí
+
         index = index.upper()
         if index not in ("NDVI", "NDMI", "SI"):
             raise ValueError("index debe ser NDVI, NDMI o SI")
-
         if month < 1 or month > 12:
             raise ValueError("month debe estar entre 1 y 12")
-
         if vmin is not None and vmax is not None and vmin >= vmax:
             raise ValueError("vmin debe ser menor que vmax")
 
@@ -233,17 +271,15 @@ class GEEService:
         if not owner_project:
             raise ValueError("Proyecto owner del mapa no determinado")
 
-        scoped = _CREDENTIALS.with_scopes(["https://www.googleapis.com/auth/earthengine"])
-        scoped.refresh(GoogleAuthRequest())
+        token = _get_access_token()
 
-        billing_project = settings.EARTHENGINE_PROJECT  # 👈 tu proyecto (habilitado para EE)
         headers = {
-            "Authorization": f"Bearer {scoped.token}",
+            "Authorization": f"Bearer {token}",
             "Accept": "image/png",
         }
-        # Solo añade el header si tienes proyecto de facturación configurado
-        if billing_project:
-            headers["X-Goog-User-Project"] = billing_project  # ✅ factura a TU proyecto
+        # Factura a tu proyecto si corresponde
+        if settings.EARTHENGINE_PROJECT:
+            headers["X-Goog-User-Project"] = settings.EARTHENGINE_PROJECT
 
         url = f"https://earthengine.googleapis.com/v1/projects/{owner_project}/maps/{mapid}/tiles/{z}/{x}/{y}"
         return requests.get(url, headers=headers, timeout=30)
