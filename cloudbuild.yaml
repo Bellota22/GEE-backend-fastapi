@@ -29,6 +29,7 @@ steps:
       - --allow-unauthenticated
       - --port=${_PORT}
       - --service-account=${_RUNTIME_SA}
+      - --timeout=600
       # Opcionales comunes:
       - --memory=512Mi
       - --cpu=1
