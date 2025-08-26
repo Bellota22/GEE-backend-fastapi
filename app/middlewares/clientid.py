@@ -58,4 +58,4 @@ def setup_clientid_middleware(app: FastAPI) -> None:
     Args:
         app: FastAPI application instance
     """
-    app.add_middleware(ClientIdMiddleware)
+    # app.add_middleware(ClientIdMiddleware)

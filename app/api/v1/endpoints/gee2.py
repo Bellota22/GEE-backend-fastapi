@@ -2,28 +2,29 @@
 
 import os
 import datetime
-from typing import List, Optional
-from fastapi.responses import JSONResponse
+from typing import List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
 import ee
+import requests
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
-
-from app.db.session import get_db
-from app.utils.response import create_response
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from pydantic import BaseModel
 
 router = APIRouter(
     prefix="/gee/indices",
     tags=["GEE Indices"]
 )
 
-# ————— Inicialización de EE —————
-
+# ========= Config & EE Init =========
 PROJECT_ID = os.getenv("EARTHENGINE_PROJECT", None)
 KEY_PATH = os.getenv("GEE_KEY_PATH", "D:\\Projects\\Projects\\58-AGRAS\\key.json")
+TILES_DEFAULT_CID = os.getenv("TILES_DEFAULT_CID", "abc123")
 
-# Carga credenciales
+if not KEY_PATH or not os.path.exists(KEY_PATH):
+    raise RuntimeError("GEE_KEY_PATH no configurado o archivo no existe.")
+
 credentials = service_account.Credentials.from_service_account_file(
     KEY_PATH,
     scopes=["https://www.googleapis.com/auth/earthengine"],
@@ -31,23 +32,21 @@ credentials = service_account.Credentials.from_service_account_file(
 )
 ee.Initialize(credentials=credentials, project=PROJECT_ID)
 
-# ————— Models —————
-
+# ========= Modelos =========
 class IndexResponse(BaseModel):
     year: int
     month: int
-    ndvi: float
-    ndmi: float
-    si: float
+    ndvi: Optional[float]
+    ndmi: Optional[float]
+    si: Optional[float]
 
 class TimeSeriesResponse(BaseModel):
     dates: List[datetime.date]
-    ndvi: List[float]
-    ndmi: List[float]
-    si: List[float]
+    ndvi: List[Optional[float]]
+    ndmi: List[Optional[float]]
+    si: List[Optional[float]]
 
-# ————— Funciones auxiliares de GEE —————
-
+# ========= Helpers GEE =========
 def mask_clouds(img: ee.Image) -> ee.Image:
     qa = img.select("QA60")
     mask = qa.bitwiseAnd(1 << 10).eq(0).And(qa.bitwiseAnd(1 << 11).eq(0))
@@ -65,107 +64,124 @@ def add_indices(img: ee.Image) -> ee.Image:
 
     return img.addBands([ndvi, ndmi, si])
 
-def build_monthly_composites(
-    aoi: ee.Geometry,
-    start_date: str,
-    end_date: str
-) -> ee.ImageCollection:
-    """Devuelve una ImageCollection con medianas mensuales de NDVI, NDMI y SI."""
-    start = datetime.datetime.fromisoformat(start_date)
-    end   = datetime.datetime.fromisoformat(end_date)
-    years = list(range(start.year, end.year + 1))
-    months = list(range(1, 13))
+def build_monthly_composites(aoi: ee.Geometry, start_date: str, end_date: str) -> ee.ImageCollection:
+    start = ee.Date(start_date)
+    end   = ee.Date(end_date)
+    start_year = ee.Number.parse(start.format('Y'))
+    end_year   = ee.Number.parse(end.format('Y'))
+    years  = ee.List.sequence(start_year, end_year)
+    months = ee.List.sequence(1, 12)
 
-    imgs = []
-    for y in years:
-        for m in months:
-            # Definimos rango mensual
-            d0 = datetime.date(y, m, 1)
-            d1 = (d0 + datetime.timedelta(days=32)).replace(day=1)
-            coll = (
-                ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
-                .filterDate(d0.isoformat(), d1.isoformat())
-                .filterBounds(aoi)
-                .map(mask_clouds)
-                .map(lambda i: i.select(["B3","B4","B8","B11"]).multiply(0.0001))
-                .map(add_indices)
-            )
+    def per_image(y, m):
+        y = ee.Number(y)
+        m = ee.Number(m)
+        m_start = ee.Date.fromYMD(y, m, 1)
+        m_end   = m_start.advance(1, 'month')
 
-            # Usamos ee.Algorithms.If en vez de .conditional()
-            img_or_null = ee.Algorithms.If(
-                coll.size().gt(0),
-                coll.median()
-                    .set("year", y)
-                    .set("month", m)
-                    .set("system:time_start", ee.Date.fromYMD(y, m, 1).millis()),
-                None
-            )
-            # ee.Algorithms.If devuelve un ee.Image cuando hay datos, o None; 
-            # envolvemos en ee.Image() solo si no es None
-            imgs.append(ee.Image(img_or_null) if isinstance(img_or_null, ee.Image) else img_or_null)
+        coll = (
+            ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
+            .filterDate(m_start, m_end)
+            .filterBounds(aoi)
+            .map(mask_clouds)
+            .map(lambda i: i.select(["B3","B4","B8","B11"]).multiply(0.0001))
+            .map(add_indices)
+        )
 
-    # Filtramos los None y construimos la ImageCollection
-    return ee.ImageCollection([img for img in imgs if img is not None])
+        img = ee.Image(ee.Algorithms.If(
+            coll.size().gt(0),
+            coll.median().set({
+                "year": y,
+                "month": m,
+                "system:time_start": m_start.millis()
+            }),
+            ee.Image(0).updateMask(ee.Image(0)).set({
+                "empty": 1,
+                "year": y,
+                "month": m,
+                "system:time_start": m_start.millis()
+            })
+        ))
+        return img.clip(aoi)
 
+    images_nested = years.map(lambda yy: months.map(lambda mm: per_image(yy, mm)))
+    images = ee.List(images_nested).flatten()
 
-@router.get(
-    "/monthly",
-    response_model=List[IndexResponse],
-    summary="Valores medios mensuales de NDVI, NDMI y SI"
-)
-async def get_monthly_indices(
-    lon_min: float = Query(-71.88100053463857, description="Longitud mínima AOI"),
-    lat_min: float = Query(-16.73354802470063, description="Latitud mínima AOI"),
-    lon_max: float = Query(-71.87370492611807, description="Longitud máxima AOI"),
-    lat_max: float = Query(-16.73001355926052, description="Latitud máxima AOI"),
-    start: str = Query("2023-01-01", description="Fecha inicio (YYYY-MM-DD)"),
-    end: str = Query(datetime.date.today().isoformat(), description="Fecha fin (YYYY-MM-DD)")
+    ic = ee.ImageCollection.fromImages(images)
+    ic = ic.filter(ee.Filter.neq('empty', 1))
+    ic = ic.filterDate(start, end)
+    return ic
+
+# --------- util: parsea mapid devolviendo (project_owner, map_id) ----------
+def parse_mapid(raw_mapid: str) -> Tuple[Optional[str], str]:
+    """
+    raw_mapid puede venir como:
+      - 'projects/<project_owner>/maps/<map_id>'
+      - '<map_id>'
+    Devuelve (project_owner, map_id). project_owner puede ser None si no venía en el string.
+    """
+    parts = raw_mapid.split("/")
+    if len(parts) >= 4 and parts[0] == "projects" and parts[2] == "maps":
+        return parts[1], parts[3]
+    return None, raw_mapid
+
+# ========= Endpoints =========
+@router.get("/monthly", response_model=List[IndexResponse], summary="Medias mensuales NDVI/NDMI/SI")
+def get_monthly_indices(
+    lon_min: float = Query(..., description="Longitud mínima AOI"),
+    lat_min: float = Query(..., description="Latitud mínima AOI"),
+    lon_max: float = Query(..., description="Longitud máxima AOI"),
+    lat_max: float = Query(..., description="Latitud máxima AOI"),
+    start: str = Query("2023-01-01", description="YYYY-MM-DD"),
+    end: str = Query(datetime.date.today().isoformat(), description="YYYY-MM-DD"),
 ):
-    # Usar la AOI predefinida si no cambia
-    aoi = ee.Geometry.Polygon([
-        [lon_min, lat_min],
-        [lon_max, lat_min],
-        [lon_max, lat_max],
-        [lon_min, lat_max],
-        [lon_min, lat_min],
-    ])
-    coll = build_monthly_composites(aoi, start, end)
-    features = coll.toList(coll.size())
+    aoi = ee.Geometry.Polygon(
+        [
+            [lon_min, lat_min],
+            [lon_max, lat_min],
+            [lon_max, lat_max],
+            [lon_min, lat_max],
+            [lon_min, lat_min],
+        ],
+        None,
+        False,
+    )
 
-    results = []
-    for i in range(coll.size().getInfo()):
-        img = ee.Image(features.get(i))
-        year  = img.get("year").getInfo()
-        month = img.get("month").getInfo()
+    coll = build_monthly_composites(aoi, start, end)
+    size = coll.size().getInfo()
+    if size == 0:
+        return []
+
+    imgs = coll.toList(size)
+    results: List[IndexResponse] = []
+    for i in range(size):
+        img   = ee.Image(imgs.get(i))
+        year  = int(ee.Number(img.get("year")).getInfo())
+        month = int(ee.Number(img.get("month")).getInfo())
         stats = img.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=aoi,
-            scale=10
-        ).getInfo()
+            scale=10,
+            maxPixels=1e9,
+            tileScale=2,
+        ).getInfo() or {}
         results.append(IndexResponse(
-            year=year,
-            month=month,
-            ndvi=stats.get("NDVI", None),
-            ndmi=stats.get("NDMI", None),
-            si=stats.get("SI", None),
+            year=year, month=month,
+            ndvi=stats.get("NDVI"),
+            ndmi=stats.get("NDMI"),
+            si=stats.get("SI"),
         ))
-
     return results
 
-@router.get(
-    "/timeseries",
-    response_model=TimeSeriesResponse,
-    summary="Serie temporal completa de los índices"
-)
-async def get_time_series(
-    lon_min: float = Query(-71.88100053463857),
-    lat_min: float = Query(-16.73354802470063),
-    lon_max: float = Query(-71.87370492611807),
-    lat_max: float = Query(-16.73001355926052),
+@router.get("/timeseries", response_model=TimeSeriesResponse, summary="Serie temporal de índices")
+def get_time_series(
+    lon_min: float = Query(...),
+    lat_min: float = Query(...),
+    lon_max: float = Query(...),
+    lat_max: float = Query(...),
     start: str = Query("2023-01-01"),
-    end: str = Query(datetime.date.today().isoformat())
+    end: str = Query(datetime.date.today().isoformat()),
 ):
-    monthly = await get_monthly_indices(lon_min, lat_min, lon_max, lat_max, start, end)
+    monthly = get_monthly_indices(lon_min, lat_min, lon_max, lat_max, start, end)
     dates = [datetime.date(m.year, m.month, 1) for m in monthly]
     return TimeSeriesResponse(
         dates=dates,
@@ -174,90 +190,128 @@ async def get_time_series(
         si=[m.si for m in monthly],
     )
 
-@router.get(
-    "/tile",
-    summary="Devuelve URL de tiles para un índice (NDVI/NDMI/SI) en un mes dado",
-)
-async def get_index_tile(
+@router.get("/tile", summary="URL template (z/x/y) de tiles para un índice y mes")
+def get_index_tile(
+    request: Request,
     lon_min: float = Query(...),
     lat_min: float = Query(...),
     lon_max: float = Query(...),
     lat_max: float = Query(...),
-    year: int = Query(..., description="Año, e.g. 2025"),
-    month: int = Query(..., description="Mes 1-12"),
+    year: int = Query(..., description="Año, e.g., 2025"),
+    month: int = Query(..., description="Mes 1–12"),
     index: str = Query("NDVI", description="NDVI | NDMI | SI"),
-    palette: Optional[str] = Query(None, description="Paleta opcional coma-separada"),
-    # opcionales para control visual
+    palette: Optional[str] = Query(None, description="Hex o nombres separados por coma"),
     vmin: Optional[float] = Query(None),
     vmax: Optional[float] = Query(None),
 ):
-    """
-    Devuelve un template de URL para tiles (z/x/y) renderizados por Earth Engine.
-    """
     index = index.upper()
     if index not in ("NDVI", "NDMI", "SI"):
         raise HTTPException(status_code=400, detail="index debe ser NDVI, NDMI o SI")
 
-    # AOI
-    aoi = ee.Geometry.Polygon([
-        [lon_min, lat_min],
-        [lon_max, lat_min],
-        [lon_max, lat_max],
-        [lon_min, lat_max],
-        [lon_min, lat_min],
-    ])
+    aoi = ee.Geometry.Polygon(
+        [
+            [lon_min, lat_min],
+            [lon_max, lat_min],
+            [lon_max, lat_max],
+            [lon_min, lat_max],
+            [lon_min, lat_min],
+        ],
+        None,
+        False,
+    )
 
-    # Rango de fechas del mes
     d0 = datetime.date(year, month, 1)
     d1 = (d0 + datetime.timedelta(days=32)).replace(day=1)
-    start_iso = d0.isoformat()
-    end_iso = d1.isoformat()
 
-    # construir colección y calcular mediana mensual con índices
     coll = (
-    ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
-    .filterDate(start_iso, end_iso)
-    .filterBounds(aoi)
-    .map(mask_clouds)
-    .map(lambda i: i.select(["B3","B4","B8","B11"]).multiply(0.0001))
-    .map(add_indices)
-)
-
-    size = coll.size().getInfo()
-    if size == 0:
+        ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
+        .filterDate(d0.isoformat(), d1.isoformat())
+        .filterBounds(aoi)
+        .map(mask_clouds)
+        .map(lambda i: i.select(["B3","B4","B8","B11"]).multiply(0.0001))
+        .map(add_indices)
+    )
+    if coll.size().getInfo() == 0:
         raise HTTPException(status_code=404, detail="No hay imágenes para el mes seleccionado")
 
-    # median y CLIP al AOI (critical: clip para que el tile solo pinte el área seleccionada)
-    img = coll.median().select(index).clip(aoi)
-
-    # visualización por defecto (puedes sobreescribir con palette/vmin/vmax en query params)
     defaults = {
         "NDVI": {"min": -0.1, "max": 0.4, "palette": ['#8c510a', '#d8b365', '#f6e8c3', '#c7eae5', '#5ab4ac', '#01665e']},
         "NDMI": {"min": -0.2, "max": 0.2, "palette": ['#d73027', '#f7f7f7', '#4575b4']},
-        "SI":   {"min": 1.0,  "max": 2.5, "palette": ['#ffffff', '#fff7bc', '#fee391', '#fec44f', '#fe9929', '#ec7014', '#cc4c02', '#8c2d04']},
+        "SI":   {"min":  1.0, "max": 2.5, "palette": ['#ffffff', '#fff7bc', '#fee391', '#fec44f', '#fe9929', '#ec7014', '#cc4c02', '#8c2d04']},
     }
     vis = defaults[index].copy()
     if palette:
-        vis["palette"] = palette.split(",")
-    if vmin is not None:
-        vis["min"] = float(vmin)
-    if vmax is not None:
-        vis["max"] = float(vmax)
+        vis["palette"] = [p.strip() for p in palette.split(",") if p.strip()]
+    if vmin is not None: vis["min"] = float(vmin)
+    if vmax is not None: vis["max"] = float(vmax)
 
-    # Opcional: forzar formato png para transparencia
-    vis["format"] = "png"
+    median  = coll.median().select(index).clip(aoi)
+    vis_img = median.visualize(min=vis["min"], max=vis["max"], palette=vis["palette"]).clip(aoi)
 
-    # obtener mapid + token
-    mapid = img.getMapId(vis)
+    # MapId (Cloud): puede venir con el proyecto dueño incluido
+    mapid = vis_img.getMapId({"format": "png"})
+    raw_mapid = str(mapid["mapid"])  # ej: 'projects/mi-proyecto/maps/<id>' OR '<id>'
+    project_owner, just_id = parse_mapid(raw_mapid)
+    map_project = project_owner or PROJECT_ID  # usa el dueño real si viene, si no tu PROJECT_ID
 
-    # template con token (lista para {z}/{x}/{y})
-    tile_url = f"https://earthengine.googleapis.com/map/{mapid['mapid']}/{{z}}/{{x}}/{{y}}?token={mapid['token']}"
+    # Construye URL del proxy incluyendo el proyecto dueño
+    # ruta: /gee/indices/tiles/{project}/{mapid}/{z}/{x}/{y}.png
+    path = request.app.url_path_for("proxy_tile", project=map_project, mapid=just_id, z=0, x=0, y=0)
+    base = str(request.base_url).rstrip("/")
+    template = f"{base}{path}".replace("/0/0/0.png", "/{z}/{x}/{y}.png")
+
+    # Añade siempre cid (UrlTile no envía headers)
+    client_id = request.headers.get("x-client-id") or request.headers.get("X-Client-ID")
+    cid = client_id or TILES_DEFAULT_CID
+    sep = "&" if "?" in template else "?"
+    template = f"{template}{sep}cid={cid}"
 
     return JSONResponse({
-        "tile_url_template": tile_url,
+        "tile_url_template": template,
         "vis": vis,
         "year": year,
         "month": month,
         "index": index,
-        "mapid": {"mapid": mapid["mapid"]}
+        "mapid": {"mapid": just_id, "project": map_project},
     })
+
+@router.get("/tiles/{project}/{mapid}/{z}/{x}/{y}.png", name="proxy_tile")
+def proxy_tile(project: str, mapid: str, z: int, x: int, y: int, request: Request):
+    """
+    Proxy de tiles hacia EE Cloud API.
+    Se usa el 'project' dueño del map (el que vino en raw_mapid) para evitar 403/404.
+    """
+    try:
+        cid = request.query_params.get("cid")
+
+        if not project:
+            raise HTTPException(status_code=500, detail="Proyecto del mapa no determinado")
+
+        # Refresca token OAuth (Service Account)
+        scoped = credentials.with_scopes(["https://www.googleapis.com/auth/earthengine"])
+        scoped.refresh(GoogleAuthRequest())
+
+        headers = {
+            "Authorization": f"Bearer {scoped.token}",
+            "Accept": "image/png",
+            "X-Goog-User-Project": project,   # cobra en el proyecto dueño del map
+        }
+
+        ee_tile_url = f"https://earthengine.googleapis.com/v1/projects/{project}/maps/{mapid}/tiles/{z}/{x}/{y}"
+        r = requests.get(ee_tile_url, headers=headers, timeout=30)
+
+        if r.status_code != 200:
+            # Log claro para que veas el motivo exacto que devuelve Google
+            print(f"[proxy_tile] EE error {r.status_code} for {ee_tile_url}: {r.text}")
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+
+        return Response(
+            content=r.content,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400, stale-while-revalidate=604800"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("[proxy_tile] error:", str(e))
+        raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
