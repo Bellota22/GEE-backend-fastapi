@@ -1,23 +1,32 @@
-# cloudbuild.yaml — Build & Deploy a Cloud Run con Secret Manager
+# cloudbuild.yaml — Build & Deploy a Cloud Run (GCP)
 
 substitutions:
+  # Ajusta estos valores si quieres
   _SERVICE_NAME: gee-backend
-  _REGION: southamerica-west1
-  _AR_LOCATION: southamerica-west1
-  _AR_REPO: containers
-  _PORT: "8000"                             # tu FastAPI suele escuchar en 8000
-  _RUNTIME_SA: gee-backend-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  _REGION: us-central1          # ej: southamerica-west1 (Santiago) o us-central1
+  _AR_LOCATION: us              # us / europe / asia o una región (p.ej., southamerica-west1)
+  _AR_REPO: containers          # nombre de tu repositorio en Artifact Registry
+  _PORT: "8080"                 # puerto en el que escucha tu app dentro del contenedor
+
+options:
+  logging: CLOUD_LOGGING_ONLY
 
 steps:
+  # 1) Build de la imagen Docker
   - name: gcr.io/cloud-builders/docker
-    args: ["build","-t",
-           "${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:${SHORT_SHA}",
-           "."]
+    args:
+      - build
+      - -t
+      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:${SHORT_SHA}
+      - .
 
+  # 2) Push de la imagen a Artifact Registry
   - name: gcr.io/cloud-builders/docker
-    args: ["push",
-           "${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:${SHORT_SHA}"]
+    args:
+      - push
+      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:${SHORT_SHA}
 
+  # 3) Deploy a Cloud Run (plataforma totalmente administrada)
   - name: gcr.io/cloud-builders/gcloud
     args:
       - run
@@ -28,20 +37,15 @@ steps:
       - --platform=managed
       - --allow-unauthenticated
       - --port=${_PORT}
-      - --service-account=${_RUNTIME_SA}
       # Opcionales comunes:
       - --memory=512Mi
       - --cpu=1
       - --concurrency=80
       - --min-instances=0
       - --max-instances=3
-      # Env normales (no sensibles):
-      - --set-env-vars=POSTGRES_USER=postgres,POSTGRES_DB=python_demo,CLIENT_IDS=abc123
-      # Secretos desde Secret Manager:
-      - --set-secrets=POSTGRES_PASSWORD=projects/$PROJECT_ID/secrets/POSTGRES_PASSWORD:latest,JWT_SECRET_KEY=projects/$PROJECT_ID/secrets/JWT_SECRET_KEY:latest,DATABASE_URL=projects/$PROJECT_ID/secrets/DATABASE_URL:latest
+      # - --set-env-vars=ENV=prod,DEBUG=false
 
 images:
   - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:${SHORT_SHA}
-  
-options:
-  logging: CLOUD_LOGGING_ONLY
+
+timeout: "1200s"
