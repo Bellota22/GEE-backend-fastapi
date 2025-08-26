@@ -50,7 +50,6 @@ def _resolve_credentials() -> Tuple[Credentials, Optional[str]]:
     return creds, project_id
 
 def ensure_ee_initialized() -> None:
-    """Inicializa Earth Engine una sola vez de forma segura."""
     global _EE_INIT, _CREDS
     if _EE_INIT:
         return
@@ -58,6 +57,15 @@ def ensure_ee_initialized() -> None:
         if _EE_INIT:
             return
         creds, project_id = _resolve_credentials()
+        # 👇 Log útil: de dónde salen las credenciales
+        origin = "ADC"
+        try:
+            from google.oauth2.service_account import Credentials as SACreds
+            if isinstance(creds, SACreds):
+                origin = "ServiceAccount"
+        except Exception:
+            pass
+        print(f"[EE] Initializing with {origin}, project={project_id}")
         ee.Initialize(credentials=creds, project=project_id)
         _CREDS = creds
         _EE_INIT = True
