@@ -21,10 +21,10 @@ RUN pip install --upgrade pip setuptools wheel \
 
 # Copia código y credencial
 COPY . /app/
-COPY key.json /app/key.json
+# COPY key.json /app/key.json
 
 # Señala credencial (puedes sobreescribir en compose)
-ENV GOOGLE_APPLICATION_CREDENTIALS=/app/key.json
+# ENV GOOGLE_APPLICATION_CREDENTIALS=/app/key.json
 
 EXPOSE 8000
 
