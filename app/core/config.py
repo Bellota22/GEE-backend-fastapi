@@ -42,6 +42,8 @@ class Settings:
     POSTGRES_DB: str
     DATABASE_URL: Optional[str]
 
+    SALINITY_RF_TRAINING_ASSET: Optional[str]
+
     # ---- GEE ----
     EARTHENGINE_PROJECT: Optional[str]
     GEE_KEY_PATH: Optional[str]
@@ -52,7 +54,7 @@ class Settings:
     S2_COLLECTION: str
     TILE_CACHE_SECONDS: int
     TILE_STALE_SECONDS: int
-
+    
     # ---- Otros ----
     CLIENT_IDS: str
 
@@ -72,6 +74,8 @@ class Settings:
         self.JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "*")
         self.PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
         self.JWT_ISSUER = os.getenv("JWT_ISSUER", (self.PUBLIC_BASE_URL or "http://localhost:8000"))
+
+        self.SALINITY_RF_TRAINING_ASSET = os.getenv("SALINITY_RF_TRAINING_ASSET", "")
 
         # -------- CORS --------
         cors_origins = os.getenv("BACKEND_CORS_ORIGINS", "*")

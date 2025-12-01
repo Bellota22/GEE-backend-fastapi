@@ -31,7 +31,7 @@ steps:
       - --service-account=${_RUNTIME_SA}
       - --timeout=600
       # Opcionales comunes:
-      - --memory=512Mi
+      - --memory=128Mi
       - --cpu=1
       - --concurrency=80
       - --min-instances=0

@@ -1,6 +1,8 @@
 # app/api/v1/endpoints/gee2.py
 import datetime
 from typing import List, Optional
+import ee
+import traceback
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -108,3 +110,57 @@ def proxy_tile(project: str, mapid: str, z: int, x: int, y: int, request: Reques
     except Exception as e:
         print("[proxy_tile] error:", str(e))
         raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
+
+@router.get(
+    "/salinity/rf/tile",
+    response_model=TileTemplateResponse,
+    summary="Tiles de salinidad aparente (RF multi-fuente)",
+)
+def get_salinity_rf_tile(
+    request: Request,
+    lon_min: float = Query(...),
+    lat_min: float = Query(...),
+    lon_max: float = Query(...),
+    lat_max: float = Query(...),
+    center_date: str = Query("2025-09-14", description="YYYY-MM-DD"),
+    palette: Optional[str] = Query(None),
+    vmin: Optional[float] = Query(0.0),
+    vmax: Optional[float] = Query(0.6),
+):
+    try:
+        payload = service.salinity_rf_tile_template(
+            lon_min, lat_min, lon_max, lat_max,
+            center_date=center_date,
+            palette_csv=palette,
+            vmin=vmin,
+            vmax=vmax,
+            base_url=str(request.base_url),
+            proxy_path_builder=lambda **kw: request.app.url_path_for("proxy_tile", **kw),
+            client_id_header=request.headers.get("x-client-id")
+            or request.headers.get("X-Client-ID"),
+        )
+        return JSONResponse(payload)
+    except Exception as e:
+        print("[salinity_rf_tile] ERROR:", repr(e))
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error preparando tiles RF: {e}")
+
+@router.get("/salinity/rf/point")
+def get_salinity_at_point(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    center_date: str = Query("2025-09-14"),
+):
+    try:
+        aoi = ee.Geometry.Point([lon, lat]).buffer(20)  # 20 m alrededor
+        img = service._salinity_rf_image(aoi, center_date)
+        stats = img.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=aoi,
+            scale=10,
+            maxPixels=1e9,
+        )
+        ce = stats.get("CE_RF").getInfo()
+        return {"lat": lat, "lon": lon, "center_date": center_date, "ce_rf": ce}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error calculando CE_RF: {e}")

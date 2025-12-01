@@ -18,6 +18,12 @@ _EE_LOCK = threading.Lock()
 _EE_INIT = False
 _CREDS: Optional[Credentials] = None
 
+RF_PROPS = [
+    "NDVI","NDMI","SI","NDB12B7","TBI",
+    "EVI","MSAVI2","NDRE","MSI",
+    "VVdB","VH_VV",
+]
+
 EE_SCOPES = [
     "https://www.googleapis.com/auth/earthengine",
     "https://www.googleapis.com/auth/devstorage.read_write",  # si no usas GCS, puedes quitar esta
@@ -291,3 +297,216 @@ class GEEService:
 
         url = f"https://earthengine.googleapis.com/v1/projects/{owner_project}/maps/{mapid}/tiles/{z}/{x}/{y}"
         return requests.get(url, headers=headers, timeout=30)
+
+
+    def _build_comp_all(self, aoi: ee.Geometry, center_date: str) -> ee.Image:
+        """
+        Replica tu compAll: S2 (ventana ±3 días) + índices + S1 (VVdB, VH_VV)
+        """
+        ensure_ee_initialized()
+
+        fecha_centro = ee.Date(center_date)
+        fecha_ini = fecha_centro.advance(-3, "day")
+        fecha_fin = fecha_centro.advance(4, "day")
+
+        # ---- Sentinel-2 ----
+        s2 = (
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            .filterDate(fecha_ini, fecha_fin)
+            .filterBounds(aoi)
+            .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 40))
+        )
+
+        def mask_s2(img):
+            scl = img.select("SCL")
+            bad = (
+                scl.eq(3)
+                .Or(scl.eq(7))
+                .Or(scl.eq(8))
+                .Or(scl.eq(9))
+                .Or(scl.eq(10))
+            )
+            return img.updateMask(bad.Not())
+
+        comp = s2.map(mask_s2).median().clip(aoi)
+
+        # ----- índices ópticos -----
+        b2  = comp.select("B2")
+        b3  = comp.select("B3")
+        b4  = comp.select("B4")
+        b5  = comp.select("B5")
+        b7  = comp.select("B7")
+        b8  = comp.select("B8")
+        b8a = comp.select("B8A")
+        b11 = comp.select("B11")
+        b12 = comp.select("B12")
+
+        ndvi = comp.normalizedDifference(["B8","B4"]).rename("NDVI")
+        ndmi = comp.normalizedDifference(["B8","B11"]).rename("NDMI")
+        si   = b11.divide(b3).rename("SI")
+        ndb12b7 = comp.normalizedDifference(["B12","B7"]).rename("NDB12B7")
+
+        denom_tbi = b3.subtract(b11)
+        tbi = (
+            b12.subtract(b3)
+               .divide(denom_tbi)
+               .updateMask(denom_tbi.neq(0))
+               .rename("TBI")
+        )
+
+        evi = (
+            b8.subtract(b4).multiply(2.5)
+               .divide(
+                   b8.add(b4.multiply(6))
+                     .subtract(b2.multiply(7.5))
+                     .add(1)
+               )
+               .rename("EVI")
+        )
+
+        msavi2 = (
+            b8.multiply(2).add(1)
+               .subtract(
+                   b8.multiply(2).add(1).pow(2)
+                     .subtract(b8.subtract(b4).multiply(8))
+                     .sqrt()
+               )
+               .multiply(0.5)
+               .rename("MSAVI2")
+        )
+
+        ndre = comp.normalizedDifference(["B8A","B5"]).rename("NDRE")
+        msi  = b11.divide(b8).rename("MSI")
+
+        comp_idx = comp.addBands([
+            ndvi, ndmi, si, ndb12b7, tbi,
+            evi, msavi2, ndre, msi,
+        ])
+
+        # ----- Sentinel-1 -----
+        s1_ini_06 = fecha_centro.advance(-6, "day")
+        s1_fin_06 = fecha_centro.advance( 6, "day")
+        s1_ini_30 = fecha_centro.advance(-30, "day")
+        s1_fin_30 = fecha_centro.advance( 30, "day")
+
+        def s1_between(start, end):
+            return (
+                ee.ImageCollection("COPERNICUS/S1_GRD")
+                .filterDate(start, end)
+                .filterBounds(aoi)
+                .filter(ee.Filter.eq("instrumentMode", "IW"))
+                .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+                .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
+            )
+
+        s1col06 = s1_between(s1_ini_06, s1_fin_06)
+        s1col30 = s1_between(s1_ini_30, s1_fin_30)
+        s1_use = ee.ImageCollection(
+            ee.Algorithms.If(s1col06.size().gt(0), s1col06, s1col30)
+        )
+        has_s1 = s1_use.size().gt(0)
+
+        s1_img = ee.Image(
+            ee.Algorithms.If(
+                has_s1,
+                s1_use.median().clip(aoi),
+                ee.Image.constant([1e-6, 1e-6]).rename(["VV","VH"]).clip(aoi),
+            )
+        )
+
+        vv = s1_img.select("VV")
+        vh = s1_img.select("VH")
+        vv_safe = vv.where(vv.lte(0), 1e-6)
+        vv_db = vv_safe.log10().multiply(10).rename("VVdB")
+        vh_vv = vh.divide(vv_safe).rename("VH_VV")
+
+        comp_all = comp_idx.addBands([vv_db, vh_vv])
+
+        return comp_all.clip(aoi)
+
+    def _salinity_rf_image(self, aoi: ee.Geometry, center_date: str) -> ee.Image:
+        ensure_ee_initialized()
+
+        asset_id = settings.SALINITY_RF_TRAINING_ASSET
+        if not asset_id:
+            raise RuntimeError(
+                "Config SALINITY_RF_TRAINING_ASSET no definida. "
+                "Configura la variable de entorno con el ID del asset de entrenamiento en Earth Engine."
+            )
+
+        print("[salinityRF] usando asset:", asset_id)
+        train_fc = ee.FeatureCollection(asset_id)
+        print("[salinityRF] tamaño training:", train_fc.size().getInfo())
+
+        comp_all = self._build_comp_all(aoi, center_date)
+
+        rf = (
+            ee.Classifier.smileRandomForest(numberOfTrees=50)
+            .setOutputMode("REGRESSION")
+        )
+        rf_trained = rf.train(
+            features=train_fc,
+            classProperty="CE_mS",
+            inputProperties=RF_PROPS,
+        )
+
+        ce_rf_img = comp_all.select(RF_PROPS).classify(rf_trained).rename("CE_RF")
+        return ce_rf_img
+    
+    def salinity_rf_tile_template(
+            self,
+            lon_min: float,
+            lat_min: float,
+            lon_max: float,
+            lat_max: float,
+            center_date: str,
+            palette_csv: Optional[str],
+            vmin: Optional[float],
+            vmax: Optional[float],
+            base_url: str,
+            proxy_path_builder,
+            client_id_header: Optional[str],
+        ) -> Dict:
+            aoi = make_aoi(lon_min, lat_min, lon_max, lat_max)
+            ce_rf_img = self._salinity_rf_image(aoi, center_date)
+
+            vis = {
+                "min": 0.0,
+                "max": 0.6,
+                "palette": ["#003366","#66ccff","#ffffcc","#ffcc66","#cc6600"],
+            }
+            if vmin is not None:
+                vis["min"] = float(vmin)
+            if vmax is not None:
+                vis["max"] = float(vmax)
+            if palette_csv:
+                vis["palette"] = [p.strip() for p in palette_csv.split(",") if p.strip()]
+
+            vis_img = ce_rf_img.visualize(
+                min=vis["min"], max=vis["max"], palette=vis["palette"]
+            ).clip(aoi)
+
+            mapid = vis_img.getMapId({"format": "png"})
+            raw_mapid = str(mapid["mapid"])
+            project_owner, just_id = parse_mapid(raw_mapid)
+            owner = project_owner or "earthengine-legacy"
+
+            path_0 = proxy_path_builder(project=owner, mapid=just_id, z=0, x=0, y=0)
+            template = f"{base_url.rstrip('/')}{path_0}".replace(
+                "/0/0/0.png", "/{z}/{x}/{y}.png"
+            )
+
+            cid = client_id_header or settings.TILES_DEFAULT_CID
+            sep = "&" if "?" in template else "?"
+            template = f"{template}{sep}cid={cid}"
+
+            dt = datetime.date.fromisoformat(center_date)
+
+            return {
+                "tile_url_template": template,
+                "vis": vis,
+                "year": dt.year,
+                "month": dt.month,
+                "index": "CE_RF",
+                "mapid": {"mapid": just_id, "project": owner},
+            }
