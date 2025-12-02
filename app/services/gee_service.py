@@ -427,7 +427,7 @@ class GEEService:
     def _salinity_rf_image(self, aoi: ee.Geometry, center_date: str) -> ee.Image:
         ensure_ee_initialized()
 
-        asset_id = settings.SALINITY_RF_TRAINING_ASSET
+        asset_id = "projects/ee-gabrielvillanueva/assets/points"
         if not asset_id:
             raise RuntimeError(
                 "Config SALINITY_RF_TRAINING_ASSET no definida. "
